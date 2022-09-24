@@ -1,13 +1,17 @@
 """Reader is module to read the url list and return shards"""
-
+import os
 from multiprocessing.pool import ThreadPool
 import math
 import fsspec
 import time
+import tempfile
 import pyarrow.parquet as pq
 import pyarrow.csv as csv_pq
 import pyarrow as pa
 import pandas as pd
+
+aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
 
 
 class Reader:
@@ -34,6 +38,7 @@ class Reader:
         number_sample_per_shard,
         done_shards,
         tmp_path,
+        enable_threading=True
     ) -> None:
         self.input_format = input_format
         self.url_col = url_col
@@ -41,6 +46,7 @@ class Reader:
         self.save_additional_columns = save_additional_columns
         self.number_sample_per_shard = number_sample_per_shard
         self.done_shards = done_shards
+        self.enable_threading = enable_threading 
 
         fs, url_path = fsspec.core.url_to_fs(url_list)
         self.fs = fs
@@ -115,37 +121,42 @@ class Reader:
             begin_shard = shard_id * self.number_sample_per_shard
             end_shard = min(number_samples, (1 + shard_id) * self.number_sample_per_shard)
             df_shard = df.slice(begin_shard, end_shard - begin_shard).select(self.column_list)
-            tmp_file = self.tmp_path + f"/{full_shard_id}.feather"
+            key = f"{full_shard_id}.feather"
+            tmp_file = self.tmp_path + "/" + key
+            fs, tmp_path = fsspec.core.url_to_fs(tmp_file)
+            with tempfile.TemporaryFile() as file:
+                # Write to local file
+                with pa.ipc.new_file(file, df_shard.schema) as writer:
+                    writer.write_table(df_shard)
+                # Write to outside file
+                file.seek(0)
+                import boto3
+                s3 = boto3.resource('s3', endpoint_url='https://9ce31bddb5f4e91400b950c37b339eb2.r2.cloudflarestorage.com',
+                                    aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key )
+                bucket = tmp_path.split('/')[0]
+                s3.meta.client.upload_fileobj(file, bucket, key)
+            print(f"wrote shard {tmp_file}")
+            return (full_shard_id, tmp_file)
+
+        shards = []
+        if self.enable_threading: 
             for i in range(10):
+                # thread pool to make it faster to write files to low latency file systems (ie s3, hdfs)
                 try:
-                    fs, tmp_path = fsspec.core.url_to_fs(tmp_file)
-                    with fs.open(tmp_path, "wb") as file:
-                        with pa.ipc.new_file(file, df_shard.schema) as writer:
-                            writer.write_table(df_shard)
-                    return (full_shard_id, tmp_file)
+                    with ThreadPool(32) as thread_pool:
+                        for shard in thread_pool.imap_unordered(write_shard, shards_to_write):
+                            shards.append(shard)
+                    break
                 except Exception as e:  # pylint: disable=broad-except
                     if i != 9:
-                        print("retrying to write to file due to error:", e)
-                        time.sleep(1)
+                        print("retrying whole sharding to write to files due to error:", e)
+                        time.sleep(2 * i)
                     else:
                         raise e
-            # can't reach here
-            raise Exception("Failed to write to file.")
+        else:
+            for shard in shards_to_write:
+                shards.append(write_shard(shard))
 
-        for i in range(10):
-            shards = []
-            # thread pool to make it faster to write files to low latency file systems (ie s3, hdfs)
-            try:
-                with ThreadPool(32) as thread_pool:
-                    for shard in thread_pool.imap_unordered(write_shard, shards_to_write):
-                        shards.append(shard)
-                break
-            except Exception as e:  # pylint: disable=broad-except
-                if i != 9:
-                    print("retrying whole sharding to write to files due to error:", e)
-                    time.sleep(2 * i)
-                else:
-                    raise e
 
         shards.sort(key=lambda k: k[0])
 

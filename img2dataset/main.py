@@ -176,13 +176,16 @@ def download(
     else:
         raise ValueError(f"Distributor {distributor} not supported")
 
-    distributor_fn(
-        processes_count,
-        downloader,
-        reader,
-        subjob_size,
-        max_shard_retry,
-    )
+    if processes_count > 1:
+        distributor_fn(
+            processes_count,
+            downloader,
+            reader,
+            subjob_size,
+            max_shard_retry,
+        )
+    else:
+        downloader(reader)
     logger_process.join()
     fs.rm(tmp_dir, recursive=True)
 
